@@ -1,9 +1,7 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 """
-This tool helps me to check Linux kernel options against
-my security hardening preferences for X86_64, ARM64, X86_32, and ARM.
-Let the computers do their job!
+This tool is for checking the security hardening options of the Linux kernel.
 
 Author: Alexander Popov <alex.popov@linux.com>
 
@@ -12,6 +10,20 @@ This module is the engine of checks.
 
 # pylint: disable=missing-class-docstring,missing-function-docstring
 # pylint: disable=line-too-long,invalid-name,too-many-branches
+
+GREEN_COLOR = '\x1b[32m'
+RED_COLOR = '\x1b[31m'
+COLOR_END = '\x1b[0m'
+
+def colorize_result(input_text):
+    if input_text is None:
+        return input_text
+    if input_text.startswith('OK'):
+        color = GREEN_COLOR
+    else:
+        assert(input_text.startswith('FAIL:')), f'unexpected result "{input_text}"'
+        color = RED_COLOR
+    return f'{color}{input_text}{COLOR_END}'
 
 
 class OptCheck:
@@ -84,7 +96,7 @@ class OptCheck:
     def table_print(self, _mode, with_results):
         print(f'{self.name:<40}|{self.type:^7}|{self.expected:^12}|{self.decision:^10}|{self.reason:^18}', end='')
         if with_results:
-            print(f'| {self.result}', end='')
+            print(f'| {colorize_result(self.result)}', end='')
 
     def json_dump(self, with_results):
         dump = [self.name, self.type, self.expected, self.decision, self.reason]
@@ -96,7 +108,7 @@ class OptCheck:
 class KconfigCheck(OptCheck):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.name = 'CONFIG_' + self.name
+        self.name = f'CONFIG_{self.name}'
 
     @property
     def type(self):
@@ -107,6 +119,12 @@ class CmdlineCheck(OptCheck):
     @property
     def type(self):
         return 'cmdline'
+
+
+class SysctlCheck(OptCheck):
+    @property
+    def type(self):
+        return 'sysctl'
 
 
 class VersionCheck:
@@ -137,7 +155,7 @@ class VersionCheck:
         ver_req = f'kernel version >= {self.ver_expected[0]}.{self.ver_expected[1]}'
         print(f'{ver_req:<91}', end='')
         if with_results:
-            print(f'| {self.result}', end='')
+            print(f'| {colorize_result(self.result)}', end='')
 
 
 class ComplexOptCheck:
@@ -147,7 +165,7 @@ class ComplexOptCheck:
                f'empty {self.__class__.__name__} check'
         assert(len(self.opts) != 1), \
                f'useless {self.__class__.__name__} check: {opts}'
-        assert(isinstance(opts[0], (KconfigCheck, CmdlineCheck))), \
+        assert(isinstance(opts[0], (KconfigCheck, CmdlineCheck, SysctlCheck))), \
                f'invalid {self.__class__.__name__} check: {opts}'
         self.result = None
 
@@ -165,9 +183,10 @@ class ComplexOptCheck:
 
     def table_print(self, mode, with_results):
         if mode == 'verbose':
-            print(f'    {"<<< " + self.__class__.__name__ + " >>>":87}', end='')
+            class_name = f'<<< {self.__class__.__name__} >>>'
+            print(f'    {class_name:87}', end='')
             if with_results:
-                print(f'| {self.result}', end='')
+                print(f'| {colorize_result(self.result)}', end='')
             for o in self.opts:
                 print()
                 o.table_print(mode, with_results)
@@ -175,7 +194,7 @@ class ComplexOptCheck:
             o = self.opts[0]
             o.table_print(mode, False)
             if with_results:
-                print(f'| {self.result}', end='')
+                print(f'| {colorize_result(self.result)}', end='')
 
     def json_dump(self, with_results):
         dump = self.opts[0].json_dump(False)
@@ -244,7 +263,7 @@ class AND(ComplexOptCheck):
                 return
 
 
-SIMPLE_OPTION_TYPES = ('kconfig', 'version', 'cmdline')
+SIMPLE_OPTION_TYPES = ('kconfig', 'cmdline', 'sysctl', 'version')
 
 
 def populate_simple_opt_with_data(opt, data, data_type):
@@ -255,12 +274,12 @@ def populate_simple_opt_with_data(opt, data, data_type):
     assert(data_type in SIMPLE_OPTION_TYPES), \
            f'invalid data type "{data_type}"'
     assert(data), \
-           f'empty data'
+           'empty data'
 
     if data_type != opt.type:
         return
 
-    if data_type in ('kconfig', 'cmdline'):
+    if data_type in ('kconfig', 'cmdline', 'sysctl'):
         opt.state = data.get(opt.name, None)
     else:
         assert(data_type == 'version'), \
@@ -269,22 +288,29 @@ def populate_simple_opt_with_data(opt, data, data_type):
 
 
 def populate_opt_with_data(opt, data, data_type):
-    if opt.type == 'complex':
+    assert(opt.type != 'version'), 'a single VersionCheck is useless'
+    if opt.type != 'complex':
+        populate_simple_opt_with_data(opt, data, data_type)
+    else:
         for o in opt.opts:
-            if o.type == 'complex':
+            if o.type != 'complex':
+                populate_simple_opt_with_data(o, data, data_type)
+            else:
                 # Recursion for nested ComplexOptCheck objects
                 populate_opt_with_data(o, data, data_type)
-            else:
-                populate_simple_opt_with_data(o, data, data_type)
-    else:
-        assert(opt.type in ('kconfig', 'cmdline')), \
-               f'bad type "{opt.type}" for a simple check'
-        populate_simple_opt_with_data(opt, data, data_type)
 
 
 def populate_with_data(checklist, data, data_type):
     for opt in checklist:
         populate_opt_with_data(opt, data, data_type)
+
+
+def override_expected_value(checklist, name, new_val):
+    for opt in checklist:
+        if opt.name == name:
+            assert(opt.type in ('kconfig', 'cmdline', 'sysctl')), \
+                   f'overriding an expected value for "{opt.type}" checks is not supported yet'
+            opt.expected = new_val
 
 
 def perform_checks(checklist):
